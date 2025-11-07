@@ -104,27 +104,6 @@ bool resolveHost(const string& host, sockaddr_storage& out, socklen_t& len) {
   return true;
 }
 
-void recvThread(int sock, const ICMP& sent, high_resolution_clock::time_point st,
-                bool& done, double& rtt, in_addr& src) {
-  char buf[512];
-  sockaddr_in from{};
-  socklen_t flen = sizeof(from);
-  while (!done) {
-    ssize_t n = recvfrom(sock, buf, sizeof(buf), 0, (sockaddr*)&from, &flen);
-    if (n < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-      break;
-    }
-    int ipLen = (buf[0] & 0x0F) * 4;
-    if (n < ipLen + (int)sizeof(ICMPPacket)) continue;
-    const ICMPPacket* rep = (const ICMPPacket*)(buf + ipLen);
-    if (sent.matches(rep)) {
-      rtt = duration_cast<microseconds>(high_resolution_clock::now() - st).count() / 1000.0;
-      src = from.sin_addr;
-      done = true;
-    }
-  }
-}
 
 int main(int argc, char* argv[]) {
   if (argc < 3) {
@@ -158,31 +137,45 @@ int main(int argc, char* argv[]) {
   double minRtt = 1e9, maxRtt = 0, sumRtt = 0;
 
   for (int seq = 1; seq <= count; ++seq) {
-    ICMP pkt(pid, seq);
-    cout << pkt.sentInfo(ipStr) << "\n";
+      ICMP pkt(pid, seq);
+      cout << pkt.sentInfo(ipStr) << "\n";
 
-    auto st = high_resolution_clock::now();
-    if (sendto(sock, pkt.raw(), pkt.size(), 0, (sockaddr*)&dst, dlen) < 0) {
-      cerr << "sendto error\n"; continue;
-    }
-    ++sent;
+      auto st = high_resolution_clock::now();
+      if (sendto(sock, pkt.raw(), pkt.size(), 0, (sockaddr*)&dst, dlen) < 0) {
+          cerr << "sendto error: " << strerror(errno) << "\n";
+          continue;
+      }
+      ++sent;
 
-    bool done = false;
-    double rtt = 0;
-    in_addr src{};
-    thread rt(recvThread, sock, ref(pkt), st, ref(done), ref(rtt), ref(src));
-    this_thread::sleep_for(milliseconds(400));
-    if (!done) cout << "Request timeout for icmp_seq=" << seq << "\n";
-    done = true;
-    if (rt.joinable()) rt.join();
+      char buf[512];
+      sockaddr_in from{};
+      socklen_t flen = sizeof(from);
 
-    if (done && rtt > 0) {
-      cout << pkt.replyInfo(src, rtt) << "\n";
+      ssize_t n = recvfrom(sock, buf, sizeof(buf), 0, (sockaddr*)&from, &flen);
+      auto end = high_resolution_clock::now();
+      double rtt = duration_cast<microseconds>(end - st).count() / 1000.0;
+      this_thread::sleep_for(milliseconds(400));
+      if (n < 0) {
+          if (errno == EAGAIN || errno == EWOULDBLOCK) {
+              cout << "Request timeout for icmp_seq=" << seq << "\n";
+          } else {
+              cerr << "recvfrom error: " << strerror(errno) << "\n";
+          }
+          continue;
+      }
+
+      int ipLen = (buf[0] & 0x0F) * 4;
+      if (n < ipLen + (int)sizeof(ICMPPacket)) continue;
+
+      const ICMPPacket* rep = (const ICMPPacket*)(buf + ipLen);
+      if (!pkt.matches(rep)) continue;  // not our packet
+
       ++recv;
       minRtt = min(minRtt, rtt);
       maxRtt = max(maxRtt, rtt);
       sumRtt += rtt;
-    }
+
+      cout << pkt.replyInfo(from.sin_addr, rtt) << "\n";
   }
 
   if (sent) {

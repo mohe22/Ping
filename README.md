@@ -37,4 +37,4 @@ sudo ./ping [-c count] <host>
 
 **Full technical breakdown:**  
 [Read the blog post](https://mohe-things.netlify.app/blogs/how-ping-work)
-```
+

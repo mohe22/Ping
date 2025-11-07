@@ -1,4 +1,3 @@
-```markdown
 # ping – Minimal C++ ICMP Ping Tool
 
 A lightweight, educational `ping` implementation in C++ using raw sockets.

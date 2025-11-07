@@ -9,6 +9,7 @@
 #include <sys/types.h>
 #include <thread>
 #include <unistd.h>
+#include <netinet/ip.h>
 using namespace std;
 using namespace std::chrono;
 
@@ -24,33 +25,26 @@ struct ICMPPacket {
 class ICMP {
 private:
   ICMPPacket packet_;
-  static string payloadHex(const uint8_t* data, size_t len) {
-    stringstream ss;
-    ss << hex << uppercase << setfill('0');
-    for (size_t i = 0; i < len; ++i)
-      ss << setw(2) << (int)data[i] << (i < len-1 ? " " : "");
-    return ss.str();
-  }
-  static string payloadAscii(const uint8_t* data, size_t len) {
-    string s;
-    for (size_t i = 0; i < len; ++i)
-      s += isprint(data[i]) ? (char)data[i] : '.';
-    return s;
-  }
-  static uint16_t calculateChecksum(const void *data, size_t len) {
+
+  static uint16_t calculateChecksum(const void *data, size_t len, bool convert_to_host = true) {
     const uint16_t *words = static_cast<const uint16_t *>(data);
     uint32_t sum = 0;
     size_t count = len / 2;
+
     for (size_t i = 0; i < count; ++i) {
-      sum += ntohs(words[i]);
+      sum += convert_to_host ? ntohs(words[i]) : words[i];
     }
+
     if (len & 1) {
-      sum += *(reinterpret_cast<const uint8_t *>(data) + len - 1);
+      uint8_t last = *(reinterpret_cast<const uint8_t *>(data) + len - 1);
+      sum += convert_to_host ? (static_cast<uint16_t>(last) << 8) : last;
     }
+
     sum = (sum >> 16) + (sum & 0xFFFF);
     sum += (sum >> 16);
     return static_cast<uint16_t>(~sum);
   }
+
 public:
   ICMP(uint16_t id = 0, uint16_t seq = 0) {
     packet_.type = 8;
@@ -60,19 +54,34 @@ public:
     memset(packet_.payload, 0xAA, sizeof(packet_.payload));
     updateChecksum();
   }
-  void setSequence(uint16_t seq) { packet_.sequence = htons(seq); updateChecksum(); }
+
+  void setSequence(uint16_t seq) {
+    packet_.sequence = htons(seq);
+    updateChecksum();
+  }
+
   void updateChecksum() {
     packet_.checksum = 0;
-    packet_.checksum = htons(calculateChecksum(&packet_, sizeof(packet_)));
+    packet_.checksum = htons(calculateChecksum(&packet_, sizeof(packet_), true));  // FIXED: true
   }
+
   uint16_t getId() const { return ntohs(packet_.id); }
   uint16_t getSeq() const { return ntohs(packet_.sequence); }
   uint16_t getCksum() const { return ntohs(packet_.checksum); }
   size_t size() const { return sizeof(packet_); }
   const ICMPPacket* raw() const { return &packet_; }
-  bool matches(const ICMPPacket* r) const {
-    return r->type == 0 && r->code == 0 &&
-           r->id == packet_.id && r->sequence == packet_.sequence;
+
+  bool matches(const ICMPPacket* r, size_t len) const {
+      if (r->type != 0 || r->code != 0) return false;
+      if (r->id != packet_.id || r->sequence != packet_.sequence) return false;
+
+      uint16_t received = r->checksum;
+      const_cast<ICMPPacket*>(r)->checksum = 0;
+
+      uint16_t computed = calculateChecksum(r, len, false);
+
+      const_cast<ICMPPacket*>(r)->checksum = received;
+      return received == computed;
   }
   string sentInfo(const string& ip) const {
     stringstream ss;
@@ -82,6 +91,7 @@ public:
        << getCksum() << dec;
     return ss.str();
   }
+
   string replyInfo(const in_addr& from, double rtt) const {
     stringstream ss;
     ss << (8 + sizeof(packet_.payload)) << " bytes from " << inet_ntoa(from)
@@ -104,7 +114,6 @@ bool resolveHost(const string& host, sockaddr_storage& out, socklen_t& len) {
   return true;
 }
 
-
 int main(int argc, char* argv[]) {
   if (argc < 3) {
     cerr << "Usage: " << argv[0] << " [-c count] <host>\n";
@@ -114,7 +123,7 @@ int main(int argc, char* argv[]) {
   int count = 4;
   string host;
   for (int i = 1; i < argc; ++i) {
-    if (string(argv[i]) == "-c" && i+1 < argc) count = atoi(argv[++i]);
+    if (string(argv[i]) == "-c" && i + 1 < argc) count = atoi(argv[++i]);
     else host = argv[i];
   }
   if (host.empty()) { cerr << "Host required\n"; return 1; }
@@ -137,45 +146,54 @@ int main(int argc, char* argv[]) {
   double minRtt = 1e9, maxRtt = 0, sumRtt = 0;
 
   for (int seq = 1; seq <= count; ++seq) {
-      ICMP pkt(pid, seq);
-      cout << pkt.sentInfo(ipStr) << "\n";
+    ICMP pkt(pid, seq);
+    cout << pkt.sentInfo(ipStr) << "\n";
 
-      auto st = high_resolution_clock::now();
-      if (sendto(sock, pkt.raw(), pkt.size(), 0, (sockaddr*)&dst, dlen) < 0) {
-          cerr << "sendto error: " << strerror(errno) << "\n";
-          continue;
+    auto st = high_resolution_clock::now();
+    if (sendto(sock, pkt.raw(), pkt.size(), 0, (sockaddr*)&dst, dlen) < 0) {
+      cerr << "sendto error: " << strerror(errno) << "\n";
+      continue;
+    }
+    ++sent;
+
+    char buf[512];
+    sockaddr_in from{};
+    socklen_t flen = sizeof(from);
+    ssize_t n = recvfrom(sock, buf, sizeof(buf), 0, (sockaddr*)&from, &flen);
+
+    auto end = high_resolution_clock::now();
+    double rtt = duration_cast<microseconds>(end - st).count() / 1000.0;
+    this_thread::sleep_for(milliseconds(400));
+
+    if (n < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        cout << "Request timeout for icmp_seq=" << seq << "\n";
+      } else {
+        cerr << "recvfrom error: " << strerror(errno) << "\n";
       }
-      ++sent;
+      continue;
+    }
 
-      char buf[512];
-      sockaddr_in from{};
-      socklen_t flen = sizeof(from);
+    const struct iphdr* ip = (const struct iphdr*)buf;
+    int ipLen = ip->ihl * 4;
+    if (n < ipLen + (int)sizeof(ICMPPacket)) {
+      cout << "Short packet (len=" << n << ")\n";
+      continue;
+    }
 
-      ssize_t n = recvfrom(sock, buf, sizeof(buf), 0, (sockaddr*)&from, &flen);
-      auto end = high_resolution_clock::now();
-      double rtt = duration_cast<microseconds>(end - st).count() / 1000.0;
-      this_thread::sleep_for(milliseconds(400));
-      if (n < 0) {
-          if (errno == EAGAIN || errno == EWOULDBLOCK) {
-              cout << "Request timeout for icmp_seq=" << seq << "\n";
-          } else {
-              cerr << "recvfrom error: " << strerror(errno) << "\n";
-          }
-          continue;
-      }
+    const ICMPPacket* rep = (const ICMPPacket*)(buf + ipLen);
+    size_t icmp_len = n - ipLen;
 
-      int ipLen = (buf[0] & 0x0F) * 4;
-      if (n < ipLen + (int)sizeof(ICMPPacket)) continue;
+    if (!pkt.matches(rep, icmp_len)) {
+      cout << "Invalid reply (checksum/ID/seq) for icmp_seq=" << seq << "\n";
+      continue;
+    }
 
-      const ICMPPacket* rep = (const ICMPPacket*)(buf + ipLen);
-      if (!pkt.matches(rep)) continue;  // not our packet
-
-      ++recv;
-      minRtt = min(minRtt, rtt);
-      maxRtt = max(maxRtt, rtt);
-      sumRtt += rtt;
-
-      cout << pkt.replyInfo(from.sin_addr, rtt) << "\n";
+    ++recv;
+    minRtt = min(minRtt, rtt);
+    maxRtt = max(maxRtt, rtt);
+    sumRtt += rtt;
+    cout << pkt.replyInfo(from.sin_addr, rtt) << "\n";
   }
 
   if (sent) {
@@ -188,6 +206,7 @@ int main(int argc, char* argv[]) {
            << minRtt << "/" << avg << "/" << maxRtt << " ms\n";
     }
   }
+
   close(sock);
   return 0;
 }

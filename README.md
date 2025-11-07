@@ -27,7 +27,6 @@ sudo ./ping [-c count] <host>
    - Matching ID and sequence
 5. Measures RTT and prints stats.
 
-> No checksum verification on receive (simplified for clarity).
 
 ## TODO
 
